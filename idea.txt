@@ -40,3 +40,13 @@ git push -u origin main
 
 
 
+Tray menu — a checkable "Start on Startup" item (with separators) that reflects the current state on launch and toggles it when clicked
+
+Tray menu additions
+"Check for Updates" — manual check, shows a dialog if already up-to-date or if the check fails
+"Update Available: vX.Y.Z" — hidden until an update is detected; clicking it triggers the install flow
+
+Install flow
+Compiled exe: downloads the asset → writes a temporary .bat that waits 2 s, replaces the exe with move /y, then relaunches it → quits the current process
+Dev/Python mode (or no .exe asset in release): opens the GitHub releases page in the browser instead
+

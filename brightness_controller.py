@@ -7,6 +7,11 @@ import sys
 import json
 import os
 import winreg
+import urllib.request
+import urllib.error
+import tempfile
+import subprocess
+import webbrowser
 from pathlib import Path
 
 
@@ -26,12 +31,25 @@ def get_autostart_command():
     if getattr(sys, 'frozen', False):
         return f'"{sys.executable}"'
     return f'"{sys.executable}" "{os.path.abspath(sys.argv[0])}"'
-from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
-                              QHBoxLayout, QPushButton, QLabel, QSlider, 
+
+
+CURRENT_VERSION = "v0.0.1"
+GITHUB_REPO = "bibekchandsah/brightness"
+GITHUB_RELEASES_PAGE = f"https://github.com/{GITHUB_REPO}/releases/latest"
+
+
+def parse_version(tag):
+    """Parse a version tag like 'v1.2.3' into a comparable tuple of ints."""
+    try:
+        return tuple(int(x) for x in tag.lstrip('v').strip().split('.'))
+    except ValueError:
+        return (0,)
+from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
+                              QHBoxLayout, QPushButton, QLabel, QSlider,
                               QTableWidget, QTableWidgetItem, QSystemTrayIcon,
                               QMenu, QMessageBox, QLineEdit, QDialog, QDialogButtonBox,
-                              QGroupBox)
-from PyQt6.QtCore import Qt, QThread, pyqtSignal
+                              QGroupBox, QProgressDialog)
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer
 from PyQt6.QtGui import QIcon, QKeySequence, QAction, QColor, QPainter, QPixmap, QImage
 from PIL import Image, ImageFilter
 import screen_brightness_control as sbc
@@ -260,6 +278,80 @@ class HotkeyListener(QThread):
             self.listener.stop()
 
 
+class UpdateChecker(QThread):
+    """Background thread that checks GitHub for a newer release."""
+    update_available = pyqtSignal(str, str, str)  # tag, download_url, release_url
+    no_update = pyqtSignal()
+    check_error = pyqtSignal(str)
+
+    def run(self):
+        try:
+            # Follow the redirect on the releases/latest page to get the tag.
+            # This avoids the GitHub REST API entirely and its 60 req/hr rate limit.
+            req = urllib.request.Request(
+                GITHUB_RELEASES_PAGE,
+                headers={"User-Agent": "BrightnessController-Updater"}
+            )
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                final_url = resp.url  # e.g. .../releases/tag/v1.2.3
+
+            # Extract tag from the final URL after the redirect
+            import re
+            m = re.search(r'/releases/tag/([^/?#]+)', final_url)
+            if not m:
+                self.no_update.emit()
+                return
+
+            tag = m.group(1).strip()
+            release_url = f"https://github.com/{GITHUB_REPO}/releases/tag/{tag}"
+
+            if parse_version(tag) > parse_version(CURRENT_VERSION):
+                # Construct asset download URL directly (no API needed)
+                download_url = (
+                    f"https://github.com/{GITHUB_REPO}/releases/download"
+                    f"/{tag}/BrightnessController.exe"
+                )
+                self.update_available.emit(tag, download_url, release_url)
+            else:
+                self.no_update.emit()
+        except Exception as exc:
+            self.check_error.emit(str(exc))
+
+
+class UpdateDownloader(QThread):
+    """Background thread that downloads a release asset."""
+    progress = pyqtSignal(int)   # 0-100
+    finished = pyqtSignal(str)   # path to downloaded temp file
+    error = pyqtSignal(str)
+
+    def __init__(self, url):
+        super().__init__()
+        self.url = url
+
+    def run(self):
+        try:
+            req = urllib.request.Request(
+                self.url,
+                headers={"User-Agent": "BrightnessController-Updater"}
+            )
+            with urllib.request.urlopen(req, timeout=120) as resp:
+                total = int(resp.headers.get("Content-Length", 0))
+                tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".exe")
+                downloaded = 0
+                while True:
+                    chunk = resp.read(65536)
+                    if not chunk:
+                        break
+                    tmp.write(chunk)
+                    downloaded += len(chunk)
+                    if total > 0:
+                        self.progress.emit(int(downloaded * 100 / total))
+                tmp.close()
+            self.finished.emit(tmp.name)
+        except Exception as exc:
+            self.error.emit(str(exc))
+
+
 class ShortcutEditDialog(QDialog):
     """Dialog for editing keyboard shortcuts"""
     
@@ -354,7 +446,9 @@ class BrightnessController(QMainWindow):
         
         self.init_ui()
         self.start_hotkey_listener()
-        
+        # Check for updates silently 5 seconds after startup
+        QTimer.singleShot(5000, lambda: self.check_for_updates(silent=True))
+
     def init_ui(self):
         """Initialize the user interface"""
         self.setWindowTitle("Brightness Controller")
@@ -519,9 +613,20 @@ class BrightnessController(QMainWindow):
         self.autostart_action.setChecked(self.is_autostart_enabled())
         self.autostart_action.triggered.connect(self.toggle_autostart)
         tray_menu.addAction(self.autostart_action)
-        
+
         tray_menu.addSeparator()
-        
+
+        check_update_action = QAction("Check for Updates", self)
+        check_update_action.triggered.connect(lambda: self.check_for_updates(silent=False))
+        tray_menu.addAction(check_update_action)
+
+        self.update_tray_action = QAction("", self)
+        self.update_tray_action.setVisible(False)
+        self.update_tray_action.triggered.connect(self.download_update)
+        tray_menu.addAction(self.update_tray_action)
+
+        tray_menu.addSeparator()
+
         quit_action = QAction("Quit", self)
         quit_action.triggered.connect(self.quit_application)
         tray_menu.addAction(quit_action)
@@ -771,6 +876,95 @@ class BrightnessController(QMainWindow):
             self.blur_overlay.hide()
         
         QApplication.quit()
+
+    def check_for_updates(self, silent=True):
+        """Start a background check for a newer GitHub release."""
+        self._update_checker = UpdateChecker()
+        self._update_checker.update_available.connect(self.on_update_available)
+        if not silent:
+            self._update_checker.no_update.connect(self._on_no_update)
+            self._update_checker.check_error.connect(self._on_update_check_error)
+        self._update_checker.start()
+
+    def on_update_available(self, tag, download_url, release_url):
+        """Called when a newer version exists on GitHub."""
+        self._pending_update_tag = tag
+        self._pending_update_download_url = download_url
+        self._pending_update_release_url = release_url
+
+        self.update_tray_action.setText(f"Update Available: {tag}")
+        self.update_tray_action.setVisible(True)
+
+        self.tray_icon.showMessage(
+            "Brightness Controller \u2014 Update Available",
+            f"Version {tag} is available. Right-click the tray icon to update.",
+            QSystemTrayIcon.MessageIcon.Information,
+            6000
+        )
+
+    def _on_no_update(self):
+        QMessageBox.information(
+            self, "No Updates",
+            f"You are already running the latest version ({CURRENT_VERSION})."
+        )
+
+    def _on_update_check_error(self, error):
+        QMessageBox.warning(
+            self, "Update Check Failed",
+            f"Could not check for updates:\n{error}"
+        )
+
+    def download_update(self):
+        """Begin downloading the update, or open the release page as fallback."""
+        tag = getattr(self, '_pending_update_tag', '')
+        download_url = getattr(self, '_pending_update_download_url', '')
+        release_url = getattr(self, '_pending_update_release_url', GITHUB_RELEASES_PAGE)
+
+        # Non-frozen (dev) mode or no .exe asset: open browser
+        if not download_url or not getattr(sys, 'frozen', False):
+            webbrowser.open(release_url)
+            return
+
+        self._progress_dialog = QProgressDialog(
+            f"Downloading {tag}...", "Cancel", 0, 100, self
+        )
+        self._progress_dialog.setWindowTitle("Downloading Update")
+        self._progress_dialog.setWindowModality(Qt.WindowModality.WindowModal)
+        self._progress_dialog.setMinimumDuration(0)
+        self._progress_dialog.setValue(0)
+
+        self._downloader = UpdateDownloader(download_url)
+        self._downloader.progress.connect(self._progress_dialog.setValue)
+        self._downloader.finished.connect(self._on_download_finished)
+        self._downloader.error.connect(self._on_download_error)
+        self._progress_dialog.canceled.connect(self._downloader.terminate)
+        self._downloader.start()
+
+    def _on_download_finished(self, tmp_path):
+        """Replace the running exe with the downloaded one and relaunch."""
+        self._progress_dialog.close()
+        current_exe = sys.executable
+        bat_lines = [
+            "@echo off",
+            "timeout /t 2 /nobreak >nul",
+            f'move /y "{tmp_path}" "{current_exe}"',
+            f'start "" "{current_exe}"',
+        ]
+        bat_fd, bat_path = tempfile.mkstemp(suffix=".bat")
+        with os.fdopen(bat_fd, 'w') as bat:
+            bat.write("\n".join(bat_lines))
+        subprocess.Popen(
+            ["cmd.exe", "/c", bat_path],
+            creationflags=subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
+        )
+        self.quit_application()
+
+    def _on_download_error(self, error):
+        self._progress_dialog.close()
+        QMessageBox.critical(
+            self, "Download Failed",
+            f"Could not download the update:\n{error}"
+        )
 
 
 def main():
