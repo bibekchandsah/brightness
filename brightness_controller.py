@@ -6,6 +6,7 @@ with customizable keyboard shortcuts.
 import sys
 import json
 import os
+import winreg
 from pathlib import Path
 
 
@@ -14,6 +15,17 @@ def resource_path(relative_path):
     if hasattr(sys, '_MEIPASS'):
         return os.path.join(sys._MEIPASS, relative_path)
     return os.path.join(os.path.dirname(os.path.abspath(__file__)), relative_path)
+
+
+DEF_AUTOSTART_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
+DEF_AUTOSTART_NAME = "BrightnessController"
+
+
+def get_autostart_command():
+    """Return the command string to register for autostart"""
+    if getattr(sys, 'frozen', False):
+        return f'"{sys.executable}"'
+    return f'"{sys.executable}" "{os.path.abspath(sys.argv[0])}"'
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
                               QHBoxLayout, QPushButton, QLabel, QSlider, 
                               QTableWidget, QTableWidgetItem, QSystemTrayIcon,
@@ -500,6 +512,16 @@ class BrightnessController(QMainWindow):
         show_action.triggered.connect(self.show)
         tray_menu.addAction(show_action)
         
+        tray_menu.addSeparator()
+        
+        self.autostart_action = QAction("Start on Startup", self)
+        self.autostart_action.setCheckable(True)
+        self.autostart_action.setChecked(self.is_autostart_enabled())
+        self.autostart_action.triggered.connect(self.toggle_autostart)
+        tray_menu.addAction(self.autostart_action)
+        
+        tray_menu.addSeparator()
+        
         quit_action = QAction("Quit", self)
         quit_action.triggered.connect(self.quit_application)
         tray_menu.addAction(quit_action)
@@ -515,6 +537,39 @@ class BrightnessController(QMainWindow):
         self.tray_icon.setToolTip("Brightness Controller")
         self.tray_icon.show()
     
+    def is_autostart_enabled(self):
+        """Check if autostart is registered in the Windows registry"""
+        try:
+            key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, DEF_AUTOSTART_KEY, 0, winreg.KEY_READ)
+            try:
+                winreg.QueryValueEx(key, DEF_AUTOSTART_NAME)
+                return True
+            except FileNotFoundError:
+                return False
+            finally:
+                winreg.CloseKey(key)
+        except Exception:
+            return False
+
+    def toggle_autostart(self, checked):
+        """Enable or disable autostart based on the tray menu checkbox"""
+        try:
+            key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, DEF_AUTOSTART_KEY, 0, winreg.KEY_SET_VALUE)
+            try:
+                if checked:
+                    winreg.SetValueEx(key, DEF_AUTOSTART_NAME, 0, winreg.REG_SZ, get_autostart_command())
+                else:
+                    try:
+                        winreg.DeleteValue(key, DEF_AUTOSTART_NAME)
+                    except FileNotFoundError:
+                        pass
+            finally:
+                winreg.CloseKey(key)
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to update autostart setting: {str(e)}")
+            # Revert checkbox state on failure
+            self.autostart_action.setChecked(not checked)
+
     def tray_icon_activated(self, reason):
         """Handle tray icon activation"""
         if reason == QSystemTrayIcon.ActivationReason.Trigger:
