@@ -1,0 +1,39 @@
+i want to create a python GUI application using modern GUI library which will "
+ctrl + shift + 0 = 0 brightness
+ctrl + shift + 1 = 10 brightness
+ctrl + shift + 2 = 20 brightness
+ctrl + shift + 3 = 30 brightness
+and so on till 9 for 90% brightness and 
+ctrl + shift + f = 100% brightness 
+and user can customize the shortcut key for it
+
+Numpad Key	Reported As	Mapped To
+Numpad 0	Insert	0
+Numpad 1	End	1
+Numpad 2	Down	2
+Numpad 3	Page Down	3
+Numpad 4	Left	4
+Numpad 6	Right	6
+Numpad 7	Home	7
+Numpad 8	Up	8
+Numpad 9	Page Up	9
+
+
+Fixed. The root cause was that the old code tracked pressed keys in a set() and removed them on release — but over time, release events get missed (screen lock, Alt+Tab, sleep/wake, losing focus). The set fills up with "ghost" keys that never get removed, so the detected combo includes stale extra keys and stops matching.
+
+What changed: Instead of maintaining our own key state, the app now uses ctypes.windll.user32.GetAsyncKeyState() to query modifier keys (Ctrl, Shift, Alt) directly from Windows on every keypress. This is always accurate — no state tracking, no stale keys, works reliably even after hours of uptime.
+
+
+# pip install -r requirements.txt
+# python brightness_controller.py
+# pyinstaller --onefile --windowed --icon=sun.png --add-data "sun.png;." --name "BrightnessController" brightness_controller.py
+
+
+
+echo "# brightness" >> README.md
+git init
+git add .
+git commit -m "first commit"
+git branch -M main
+git remote add origin https://github.com/bibekchandsah/brightness.git
+git push -u origin main

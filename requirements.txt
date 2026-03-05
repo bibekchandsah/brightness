@@ -1,0 +1,8 @@
+# pip install -r requirements.txt
+# python brightness_controller.py
+# pyinstaller --onefile --windowed --icon=sun.png --add-data "sun.png;." --name "BrightnessController" brightness_controller.py
+
+PyQt6>=6.6.0
+screen-brightness-control>=0.22.0
+pynput>=1.7.6
+Pillow>=10.0.0
