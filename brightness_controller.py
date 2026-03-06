@@ -9,7 +9,6 @@ import os
 import winreg
 import urllib.request
 import urllib.error
-import tempfile
 import subprocess
 import webbrowser
 from pathlib import Path
@@ -319,14 +318,15 @@ class UpdateChecker(QThread):
 
 
 class UpdateDownloader(QThread):
-    """Background thread that downloads a release asset."""
+    """Background thread that downloads a release asset to a specific path."""
     progress = pyqtSignal(int)   # 0-100
-    finished = pyqtSignal(str)   # path to downloaded temp file
+    finished = pyqtSignal(str)   # dest_path on success
     error = pyqtSignal(str)
 
-    def __init__(self, url):
+    def __init__(self, url, dest_path):
         super().__init__()
         self.url = url
+        self.dest_path = dest_path
 
     def run(self):
         try:
@@ -334,21 +334,32 @@ class UpdateDownloader(QThread):
                 self.url,
                 headers={"User-Agent": "BrightnessController-Updater"}
             )
+            # Download to a .part file so a failed download never leaves a broken exe
+            part_path = self.dest_path + ".part"
             with urllib.request.urlopen(req, timeout=120) as resp:
                 total = int(resp.headers.get("Content-Length", 0))
-                tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".exe")
                 downloaded = 0
-                while True:
-                    chunk = resp.read(65536)
-                    if not chunk:
-                        break
-                    tmp.write(chunk)
-                    downloaded += len(chunk)
-                    if total > 0:
-                        self.progress.emit(int(downloaded * 100 / total))
-                tmp.close()
-            self.finished.emit(tmp.name)
+                with open(part_path, 'wb') as f:
+                    while True:
+                        chunk = resp.read(65536)
+                        if not chunk:
+                            break
+                        f.write(chunk)
+                        downloaded += len(chunk)
+                        if total > 0:
+                            self.progress.emit(int(downloaded * 100 / total))
+            # Atomically rename .part → dest now that download is complete
+            if os.path.exists(self.dest_path):
+                os.remove(self.dest_path)
+            os.rename(part_path, self.dest_path)
+            self.finished.emit(self.dest_path)
         except Exception as exc:
+            # Clean up partial file on failure
+            try:
+                if os.path.exists(self.dest_path + ".part"):
+                    os.remove(self.dest_path + ".part")
+            except OSError:
+                pass
             self.error.emit(str(exc))
 
 
@@ -933,29 +944,96 @@ class BrightnessController(QMainWindow):
         self._progress_dialog.setMinimumDuration(0)
         self._progress_dialog.setValue(0)
 
-        self._downloader = UpdateDownloader(download_url)
+        # Download to the same directory as the running exe so we stay on the
+        # same filesystem — no cross-drive rename issues.
+        current_exe = sys.executable
+        exe_dir = os.path.dirname(current_exe)
+        dest_path = os.path.join(exe_dir, "update_temp.exe")
+
+        self._downloader = UpdateDownloader(download_url, dest_path)
         self._downloader.progress.connect(self._progress_dialog.setValue)
         self._downloader.finished.connect(self._on_download_finished)
         self._downloader.error.connect(self._on_download_error)
         self._progress_dialog.canceled.connect(self._downloader.terminate)
         self._downloader.start()
 
-    def _on_download_finished(self, tmp_path):
-        """Replace the running exe with the downloaded one and relaunch."""
+    def _on_download_finished(self, update_path):
+        """Spawn a batch updater next to the exe, then quit so it can replace us."""
         self._progress_dialog.close()
         current_exe = sys.executable
-        bat_lines = [
-            "@echo off",
-            "timeout /t 2 /nobreak >nul",
-            f'move /y "{tmp_path}" "{current_exe}"',
-            f'start "" "{current_exe}"',
-        ]
-        bat_fd, bat_path = tempfile.mkstemp(suffix=".bat")
-        with os.fdopen(bat_fd, 'w') as bat:
-            bat.write("\n".join(bat_lines))
+        pid = os.getpid()
+        exe_dir = os.path.dirname(current_exe)
+        old_backup = current_exe + ".old"
+        bat_path = os.path.join(exe_dir, "_bc_updater.bat")
+
+        # NOTE: 'ren' only accepts a bare filename (no path) as the 2nd argument.
+        # Using 'move' for all renames — it accepts full paths for both arguments.
+        #
+        # Steps performed by the batch after the main process exits:
+        #   1. Wait until the old PID disappears (Windows releases the file lock)
+        #   2. Extra 2-second buffer
+        #   3. move BrightnessController.exe  →  BrightnessController.exe.old  (backup)
+        #   4. move update_temp.exe           →  BrightnessController.exe       (with retry)
+        #   5. Launch BrightnessController.exe
+        #   6. Self-delete the batch file
+        bat = (
+            "@echo off\r\n"
+            "setlocal\r\n"
+            f"set OLD_PID={pid}\r\n"
+            f"set SRC={update_path}\r\n"
+            f"set DST={current_exe}\r\n"
+            f"set BAK={old_backup}\r\n"
+            "\r\n"
+            ":wait_pid\r\n"
+            "tasklist /FI \"PID eq %OLD_PID%\" 2>NUL | find /I \"%OLD_PID%\" >NUL\r\n"
+            "if not errorlevel 1 (\r\n"
+            "    timeout /t 1 /nobreak >NUL\r\n"
+            "    goto wait_pid\r\n"
+            ")\r\n"
+            "\r\n"
+            "rem Extra buffer for Windows to release the file handle\r\n"
+            "timeout /t 2 /nobreak >NUL\r\n"
+            "\r\n"
+            "rem Step 1: backup old exe (delete stale backup first)\r\n"
+            "if exist \"%BAK%\" del /f /q \"%BAK%\"\r\n"
+            "move \"%DST%\" \"%BAK%\"\r\n"
+            "if errorlevel 1 (\r\n"
+            "    echo Update failed: could not backup old exe to .old\r\n"
+            "    pause\r\n"
+            "    goto :eof\r\n"
+            ")\r\n"
+            "\r\n"
+            "rem Step 2: place new exe (with retry)\r\n"
+            "set /a RETRIES=0\r\n"
+            ":try_move\r\n"
+            "move \"%SRC%\" \"%DST%\"\r\n"
+            "if errorlevel 1 (\r\n"
+            "    set /a RETRIES+=1\r\n"
+            "    if %RETRIES% lss 10 (\r\n"
+            "        timeout /t 2 /nobreak >NUL\r\n"
+            "        goto try_move\r\n"
+            "    )\r\n"
+            "    echo Update failed: could not move update_temp.exe to BrightnessController.exe\r\n"
+            "    rem Restore backup so the app is still usable\r\n"
+            "    move \"%BAK%\" \"%DST%\"\r\n"
+            "    pause\r\n"
+            "    goto :eof\r\n"
+            ")\r\n"
+            "\r\n"
+            "rem Step 3: launch updated app\r\n"
+            "start \"\" \"%DST%\"\r\n"
+            "echo Update complete! Launching updated app...\r\n"
+            "timeout /t 3 /nobreak >NUL\r\n"
+            "del \"%~f0\"\r\n"
+        )
+
+        with open(bat_path, 'w', encoding='ascii') as f:
+            f.write(bat)
+
         subprocess.Popen(
-            ["cmd.exe", "/c", bat_path],
-            creationflags=subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
+            ["cmd.exe", "/c", "start", "cmd.exe", "/k", bat_path],
+            creationflags=subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP,
+            close_fds=True,
         )
         self.quit_application()
 

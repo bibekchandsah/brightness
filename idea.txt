@@ -27,6 +27,8 @@ What changed: Instead of maintaining our own key state, the app now uses ctypes.
 # pip install -r requirements.txt
 # python brightness_controller.py
 # pyinstaller --onefile --windowed --icon=sun.png --add-data "sun.png;." --name "BrightnessController" brightness_controller.py
+# pyinstaller --onefile --windowed --icon=sun.png --add-data "sun.png;." --name "BrightnessController" brightness_controller.py
+pyinstaller --onefile --windowed --icon=sun.png --add-data "sun.png;." --name "BrightnessController" brightness_controller.py
 
 
 
@@ -50,3 +52,24 @@ Install flow
 Compiled exe: downloads the asset → writes a temporary .bat that waits 2 s, replaces the exe with move /y, then relaunches it → quits the current process
 Dev/Python mode (or no .exe asset in release): opens the GitHub releases page in the browser instead
 
+
+
+⚙️ Update Workflow
+Update Check
+On startup (or at intervals), your app queries the GitHub Releases API (or your update server).
+Compare the local version (e.g., v0.0.2) with the latest release tag.
+
+Download Latest File
+If a newer version exists, fetch the asset URL (e.g., BrightnessController.exe).
+Download it to a same location where current program is (update_temp.exe).
+
+Replace Old Program
+Since a running executable cannot overwrite itself, use a helper updater script:
+    The main app spawns a small updater process (batch file, PowerShell, or a tiny executable).
+    The updater waits until the main app exits.
+    It then replaces the old file with the new one.
+    Finally, it restarts the updated program.
+
+🔑 Key Points
+    Don’t overwrite while running → use a helper updater.
+    Rollback option → keep older versions accessible.
